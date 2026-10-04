@@ -226,10 +226,10 @@ const KEYS_KEY='janscan.rakuten';
 function getKeys(){try{const k=JSON.parse(localStorage.getItem(KEYS_KEY)||'null');if(k&&k.app&&k.key)return k}catch(e){}return null}
 function setKeys(k){try{k?localStorage.setItem(KEYS_KEY,JSON.stringify(k)):localStorage.removeItem(KEYS_KEY)}catch(e){}}
 
-// 楽天APIは1秒1回まで。連続スキャンでも間隔をあけて順番に呼ぶ
+// 楽天APIは1.5秒以上あける。連続スキャンでも間隔をあけて順番に呼ぶ
 let queue=Promise.resolve(),lastCall=0;
 function throttle(fn){
-  const p=queue.then(async()=>{const w=1100-(Date.now()-lastCall);if(w>0)await new Promise(r=>setTimeout(r,w));lastCall=Date.now();return fn()});
+  const p=queue.then(async()=>{const w=1600-(Date.now()-lastCall);if(w>0)await new Promise(r=>setTimeout(r,w));lastCall=Date.now();return fn()});
   queue=p.catch(()=>{});return p;
 }
 function jsonp(url){
@@ -250,13 +250,37 @@ function cleanName(s){
     .replace(/送料無料|あす楽|ポイント\s*\d+\s*倍|即日発送|即納|国内正規品|正規品|メール便|ネコポス/g,' ')
     .replace(/\s+/g,' ').trim().slice(0,80);
 }
-async function rakuten(path,params,k){
-  const q=new URLSearchParams(Object.assign({format:'json',formatVersion:'2',applicationId:k.app,accessKey:k.key},params));
-  const d=await throttle(()=>jsonp('https://openapi.rakuten.co.jp/'+path+'?'+q.toString()));
-  if(d&&d.error){if(d.error==='not_found')return [];const e=new Error(d.error);e.desc=d.error_description||'';throw e}
-  const items=(d&&(d.Items||d.items))||[];
-  return items.map(x=>x.Item||x.item||x);
+// ブラウザから直接fetchで呼ぶ（楽天の新仕様ではこれが正規の方法。Refererで許可サイトを確認される）
+async function rakutenGet(url){
+  let r;
+  try{r=await fetch(url,{mode:'cors',credentials:'omit',referrerPolicy:'strict-origin-when-cross-origin'})}
+  catch(e){
+    try{return await jsonp(url)}catch(e2){throw new Error('network')}
+  }
+  const text=await r.text();let body=null;try{body=JSON.parse(text)}catch(e){}
+  if(!r.ok){
+    if(body&&body.error==='not_found')return {Items:[]};
+    const er=new Error(String(r.status));er.status=r.status;
+    er.desc=body?(body.error_description||body.message||body.error||(body.errors?JSON.stringify(body.errors):''))||text.slice(0,200):text.slice(0,200);
+    throw er;
+  }
+  return body;
 }
+async function rakuten(paths,params,k){
+  const q=new URLSearchParams(Object.assign({format:'json',formatVersion:'2',applicationId:k.app,accessKey:k.key},params)).toString();
+  let lastErr=null;
+  for(const path of paths){  // バージョン違いで404なら次の候補を試す
+    try{
+      const d=await throttle(()=>rakutenGet('https://openapi.rakuten.co.jp/'+path+'?'+q));
+      if(d&&d.error){if(d.error==='not_found')return [];const e=new Error(d.error);e.desc=d.error_description||'';throw e}
+      const items=(d&&(d.Items||d.items))||[];
+      return items.map(x=>x.Item||x.item||x);
+    }catch(e){lastErr=e;if(e.status!==404)throw e}
+  }
+  throw lastErr;
+}
+const ICHIBA=['ichibams/api/IchibaItem/Search/20260701','ichibams/api/IchibaItem/Search/20260401','ichibams/api/IchibaItem/Search/20220601'];
+const BOOKS=['services/api/BooksTotal/Search/20170404','booksms/api/BooksTotal/Search/20170404'];
 async function googleBook(isbn){
   try{
     const r=await fetch('https://www.googleapis.com/books/v1/volumes?q=isbn:'+isbn+'&maxResults=1');
@@ -266,8 +290,13 @@ async function googleBook(isbn){
   }catch(e){return null}
 }
 function errMsg(e){
-  if(e.message==='network'||e.message==='timeout')return '楽天APIに接続できませんでした。アプリID・Access Key・「許可されたWebサイト」にこのページのドメインが入っているかを確認してください。';
-  return '楽天APIからエラーが返りました（'+e.message+(e.desc?'：'+e.desc:'')+'）。設定を確認してください。';
+  if(e.message==='network'||e.message==='timeout')return '楽天APIに接続できませんでした（通信エラー）。電波の状態を確認し、少し待ってからもう一度試してください。';
+  const s=e.status,d=e.desc?'：'+e.desc:'';
+  if(s===403)return '楽天APIに断られました（403'+d+'）。「許可されたWebサイト」にこのページのドメイン（'+location.hostname+'）が入っているか、APIスコープにチェックがあるかを確認してください。';
+  if(s===400||s===401)return 'アプリIDかAccess Keyが正しくないようです（'+s+d+'）。コピーし直して保存してください。';
+  if(s===429)return '呼び出しが速すぎました（429）。少し待ってからもう一度試してください。';
+  if(s===404)return 'APIの場所が見つかりませんでした（404'+d+'）。';
+  return '楽天APIからエラーが返りました（'+e.message+d+'）。';
 }
 async function findName(jan){
   const isbn=/^97[89]\d{10}$/.test(jan);
@@ -275,10 +304,10 @@ async function findName(jan){
   if(isbn){const n=await googleBook(jan);if(n)return {name:n,src:'Google Books'}}
   if(k){
     // 本・CD・DVD・ゲームは楽天ブックスが正確
-    try{const it=await rakuten('services/api/BooksTotal/Search/20170404',{isbnjan:jan,hits:'1'},k);if(it[0]&&it[0].title)return {name:cleanName(it[0].title),src:'楽天ブックス'}}catch(e){err=e}
+    try{const it=await rakuten(BOOKS,{isbnjan:jan,hits:'1'},k);if(it[0]&&it[0].title)return {name:cleanName(it[0].title),src:'楽天ブックス'}}catch(e){err=e}
     // それ以外は楽天市場をJANで検索
     if(!isbn){
-      try{const it=await rakuten('ichibams/api/IchibaItem/Search/20260701',{keyword:jan,hits:'5'},k);
+      try{const it=await rakuten(ICHIBA,{keyword:jan,hits:'5'},k);
         for(const x of it){const n=cleanName(x.itemName);if(n)return {name:n,src:'楽天市場'}}
         err=null;  // 楽天市場に接続できていれば、ブックス側のエラーは表示しない
       }catch(e){err=e}
@@ -309,7 +338,7 @@ $('rkSave').addEventListener('click',()=>{
 $('rkTest').addEventListener('click',async()=>{
   const k=getKeys();if(!k){$('rkState').textContent='先に保存してください。';return}
   $('rkState').textContent='テスト中…';
-  try{const it=await rakuten('ichibams/api/IchibaItem/Search/20260701',{keyword:'4902370548495',hits:'1'},k);
+  try{const it=await rakuten(ICHIBA,{keyword:'4902370548495',hits:'1'},k);
     $('rkState').textContent=it.length?'接続できました。商品名の自動取得が使えます。':'接続できました（テスト商品は見つかりませんでしたが、設定は正しいです）。';
   }catch(e){$('rkState').textContent=errMsg(e)}
 });
