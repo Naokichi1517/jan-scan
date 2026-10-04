@@ -244,11 +244,28 @@ function jsonp(url){
     document.head.appendChild(s);
   });
 }
+// まとめ売り・セット表記（例：24本入×3セット、×24本、3個セット、ケース販売）を見つける
+const UNIT='(?:個|本|袋|箱|缶|枚|食|包|粒|錠|足|組|台|巻|冊|パック|P|p|袋入|セット|set|SET|ケース|カートン|ボトル|ロール|コ)';
+const BULK=new RegExp([
+  '(?:まとめ買い|まとめ売り|お得な|箱買い|ケース買い|ケース販売|大容量|業務用|送料込み?|セット販売)',
+  '\\d+\\s*'+UNIT+'\\s*(?:入り?|入)?\\s*(?:[×xX＊*]\\s*\\d+\\s*'+UNIT+'?)*',
+  '[×xX＊*]\\s*\\d+\\s*'+UNIT+'?',
+  '\\d+\\s*(?:個|本|袋|箱)?\\s*セット'
+].join('|'),'g');
+function hasBulk(s){BULK.lastIndex=0;return BULK.test(String(s||''))}
 function cleanName(s){
-  return String(s||'')
+  s=String(s||'')
     .replace(/【[^】]*】|［[^］]*］|\[[^\]]*\]|＜[^＞]*＞|<[^>]*>|≪[^≫]*≫|《[^》]*》/g,' ')
-    .replace(/送料無料|あす楽|ポイント\s*\d+\s*倍|即日発送|即納|国内正規品|正規品|メール便|ネコポス/g,' ')
-    .replace(/\s+/g,' ').trim().slice(0,80);
+    .replace(/送料無料|あす楽|ポイント\s*\d+\s*倍|即日発送|即納|国内正規品|正規品|メール便|ネコポス/g,' ');
+  s=s.replace(/[（(][^（()）]*[）)]/g,m=>hasBulk(m)?' ':m);  // まとめ売り表記のカッコ書きはカッコごと削除
+  s=s.replace(BULK,' ');
+  return s.replace(/[\s　]+/g,' ').replace(/\s*[\/／・,，、-]+\s*$/,'').replace(/[（(]\s*[）)]/g,'').replace(/\s+/g,' ').trim().slice(0,80);
+}
+// 楽天市場の結果から、まとめ売りでない出品の名前を優先して選ぶ
+function pickName(items){
+  const names=items.map(x=>x.itemName).filter(Boolean);
+  const plain=names.find(n=>!hasBulk(n));
+  return cleanName(plain||names[0]||'');
 }
 // ブラウザから直接fetchで呼ぶ（楽天の新仕様ではこれが正規の方法。Refererで許可サイトを確認される）
 async function rakutenGet(url){
@@ -307,8 +324,8 @@ async function findName(jan){
     try{const it=await rakuten(BOOKS,{isbnjan:jan,hits:'1'},k);if(it[0]&&it[0].title)return {name:cleanName(it[0].title),src:'楽天ブックス'}}catch(e){err=e}
     // それ以外は楽天市場をJANで検索
     if(!isbn){
-      try{const it=await rakuten(ICHIBA,{keyword:jan,hits:'5'},k);
-        for(const x of it){const n=cleanName(x.itemName);if(n)return {name:n,src:'楽天市場'}}
+      try{const it=await rakuten(ICHIBA,{keyword:jan,hits:'10'},k);
+        const n=pickName(it);if(n)return {name:n,src:'楽天市場'};
         err=null;  // 楽天市場に接続できていれば、ブックス側のエラーは表示しない
       }catch(e){err=e}
     }
