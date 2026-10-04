@@ -455,7 +455,7 @@ async function start(){
   const Z=window.ZXing;
   const hints=new Map();
   hints.set(Z.DecodeHintType.POSSIBLE_FORMATS,[Z.BarcodeFormat.EAN_13,Z.BarcodeFormat.EAN_8,Z.BarcodeFormat.UPC_A,Z.BarcodeFormat.UPC_E,Z.BarcodeFormat.CODE_128]);
-  hints.set(Z.DecodeHintType.TRY_HARDER,true);
+  // 注意：連続スキャンでTRY_HARDERを付けると読み取れなくなるため付けない
   reader=new Z.BrowserMultiFormatReader(hints,150);
   $('viewer').hidden=false;$('startBtn').hidden=true;$('stopBtn').hidden=false;
   setStatus('スキャン中… バーコードを赤い線に合わせてください。');
