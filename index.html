@@ -109,6 +109,7 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px}
       <div class="digits" id="curJan"></div>
       <button class="star" id="curStar" aria-pressed="false" aria-label="お気に入り">☆</button>
     </div>
+    <div class="status" id="curPrice" hidden></div>
     <input type="text" id="curName" placeholder="商品名（入れるとヒットしやすくなります）" aria-label="商品名">
     <div class="row">
       <input type="number" id="curCost" inputmode="numeric" placeholder="仕入値（円）" aria-label="仕入値">
@@ -118,7 +119,10 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px}
       <a class="btn onsale" id="curOnSale" target="_blank" rel="noopener">販売中を見る</a>
       <a class="btn sold" id="curSold" target="_blank" rel="noopener">売り切れを見る</a>
     </div>
-    <a class="btn" id="curLookup" target="_blank" rel="noopener">JANで商品名を調べる（Google）</a>
+    <div class="row">
+      <button id="autoName">商品名を自動取得</button>
+      <a class="btn" id="curLookup" target="_blank" rel="noopener">Googleで調べる</a>
+    </div>
   </section>
 
   <div class="tabs" role="tablist">
@@ -135,13 +139,30 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px}
       <button id="csvBtn">CSVで保存</button>
     </div>
     <div class="status" id="exportStatus" role="status"></div>
-    <p class="hint">コピー後、GoogleスプレッドシートやExcelのA1セルを選んで貼り付けると、日付・JAN・商品名・仕入値・メモ・メルカリURLが列ごとに入ります。</p>
+    <p class="hint">コピー後、GoogleスプレッドシートやExcelのA1セルを選んで貼り付けると、日付・JAN・商品名・本体価格・仕入値・メモ・メルカリURLが列ごとに入ります。</p>
     <details>
       <summary>コピーできないときはこちら</summary>
       <p class="hint">下の文字を長押しで全選択してコピーしてください。</p>
       <textarea id="tsvBox" readonly aria-label="転記用テキスト"></textarea>
     </details>
     <button class="danger" id="clearFav">お気に入りをすべて外す</button>
+  </section>
+
+  <section class="card">
+    <details>
+      <summary>楽天APIの設定（商品名の自動取得）</summary>
+      <div style="display:flex;flex-direction:column;gap:8px;margin-top:10px">
+        <input type="text" id="rkApp" placeholder="アプリID" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="楽天アプリID">
+        <input type="password" id="rkKey" placeholder="Access Key" autocomplete="off" aria-label="楽天Access Key">
+        <div class="row">
+          <button class="primary" id="rkSave">保存</button>
+          <button id="rkTest">接続テスト</button>
+          <button class="danger" id="rkClear">削除</button>
+        </div>
+        <div class="status" id="rkState" role="status"></div>
+        <p class="hint">キーはこのiPhoneのブラウザの中にだけ保存され、GitHubには載りません。本はキーがなくても書名を自動で探します。</p>
+      </div>
+    </details>
   </section>
 </div>
 
@@ -178,14 +199,122 @@ function addJan(jan,fromScan){
   jan=String(jan).replace(/\D/g,'');
   if(jan.length<8){setStatus('数字が短すぎます。8桁か13桁のJANを入れてください。',true);return false}
   if(!validCheck(jan)){if(!fromScan)setStatus('JANの数字が正しくないようです。もう一度確認してください。',true);return false}
+  // 本の2段バーコード：下段（191/192で始まる価格コード）は商品として登録せず、本体価格を上段のISBNに記録する
+  if(jan.length===13&&/^19[12]/.test(jan)){
+    const price=parseInt(jan.slice(7,12),10);
+    const cur=state.cur;
+    if(cur&&/^97[89]/.test(cur.jan)&&Date.now()-cur.t<20000){
+      cur.listPrice=price;save();syncCur();render();
+      setStatus('下段の価格コードを読み取りました。本体価格 ¥'+price.toLocaleString('ja-JP')+' を '+cur.jan+' に記録しました。');
+      return 'price';
+    }
+    setStatus('これは本の下段（価格コード）です。上段の978から始まるバーコードを読み取ってください。',true);
+    return 'skip';
+  }
   let it=state.items.find(i=>i.jan===jan);
   if(it){it.t=Date.now();state.items=[it,...state.items.filter(i=>i!==it)]}
   else{it={id:'i'+Date.now().toString(36),jan,name:'',cost:null,memo:'',fav:false,t:Date.now()};state.items.unshift(it)}
   if(state.items.length>500) state.items=state.items.filter((x,k)=>k<500||x.fav);
   save(); showCurrent(it,!fromScan); render();
   setStatus('読み取りました：'+jan);
+  if(!it.name) lookupName(it,false);
   return true;
 }
+
+/* ---- 商品名の自動取得 ---- */
+const KEYS_KEY='janscan.rakuten';
+function getKeys(){try{const k=JSON.parse(localStorage.getItem(KEYS_KEY)||'null');if(k&&k.app&&k.key)return k}catch(e){}return null}
+function setKeys(k){try{k?localStorage.setItem(KEYS_KEY,JSON.stringify(k)):localStorage.removeItem(KEYS_KEY)}catch(e){}}
+
+// 楽天APIは1秒1回まで。連続スキャンでも間隔をあけて順番に呼ぶ
+let queue=Promise.resolve(),lastCall=0;
+function throttle(fn){
+  const p=queue.then(async()=>{const w=1100-(Date.now()-lastCall);if(w>0)await new Promise(r=>setTimeout(r,w));lastCall=Date.now();return fn()});
+  queue=p.catch(()=>{});return p;
+}
+function jsonp(url){
+  return new Promise((res,rej)=>{
+    const cb='rk_'+Date.now().toString(36)+Math.random().toString(36).slice(2,7);
+    const s=document.createElement('script');let done=false;
+    const t=setTimeout(()=>fin(new Error('timeout')),10000);
+    function fin(err,data){if(done)return;done=true;clearTimeout(t);try{delete window[cb]}catch(e){window[cb]=undefined}s.remove();err?rej(err):res(data)}
+    window[cb]=d=>fin(null,d);
+    s.onerror=()=>fin(new Error('network'));
+    s.src=url+'&callback='+cb;
+    document.head.appendChild(s);
+  });
+}
+function cleanName(s){
+  return String(s||'')
+    .replace(/【[^】]*】|［[^］]*］|\[[^\]]*\]|＜[^＞]*＞|<[^>]*>|≪[^≫]*≫|《[^》]*》/g,' ')
+    .replace(/送料無料|あす楽|ポイント\s*\d+\s*倍|即日発送|即納|国内正規品|正規品|メール便|ネコポス/g,' ')
+    .replace(/\s+/g,' ').trim().slice(0,80);
+}
+async function rakuten(path,params,k){
+  const q=new URLSearchParams(Object.assign({format:'json',formatVersion:'2',applicationId:k.app,accessKey:k.key},params));
+  const d=await throttle(()=>jsonp('https://openapi.rakuten.co.jp/'+path+'?'+q.toString()));
+  if(d&&d.error){if(d.error==='not_found')return [];const e=new Error(d.error);e.desc=d.error_description||'';throw e}
+  const items=(d&&(d.Items||d.items))||[];
+  return items.map(x=>x.Item||x.item||x);
+}
+async function googleBook(isbn){
+  try{
+    const r=await fetch('https://www.googleapis.com/books/v1/volumes?q=isbn:'+isbn+'&maxResults=1');
+    if(!r.ok)return null;
+    const j=await r.json();const v=j.items&&j.items[0]&&j.items[0].volumeInfo;
+    return v&&v.title?v.title+(v.subtitle?' '+v.subtitle:''):null;
+  }catch(e){return null}
+}
+function errMsg(e){
+  if(e.message==='network'||e.message==='timeout')return '楽天APIに接続できませんでした。アプリID・Access Key・「許可されたWebサイト」にこのページのドメインが入っているかを確認してください。';
+  return '楽天APIからエラーが返りました（'+e.message+(e.desc?'：'+e.desc:'')+'）。設定を確認してください。';
+}
+async function findName(jan){
+  const isbn=/^97[89]\d{10}$/.test(jan);
+  const k=getKeys();let err=null;
+  if(isbn){const n=await googleBook(jan);if(n)return {name:n,src:'Google Books'}}
+  if(k){
+    // 本・CD・DVD・ゲームは楽天ブックスが正確
+    try{const it=await rakuten('services/api/BooksTotal/Search/20170404',{isbnjan:jan,hits:'1'},k);if(it[0]&&it[0].title)return {name:cleanName(it[0].title),src:'楽天ブックス'}}catch(e){err=e}
+    // それ以外は楽天市場をJANで検索
+    if(!isbn){
+      try{const it=await rakuten('ichibams/api/IchibaItem/Search/20260701',{keyword:jan,hits:'5'},k);
+        for(const x of it){const n=cleanName(x.itemName);if(n)return {name:n,src:'楽天市場'}}
+        err=null;  // 楽天市場に接続できていれば、ブックス側のエラーは表示しない
+      }catch(e){err=e}
+    }
+  }
+  return {name:null,err,noKeys:!k};
+}
+async function lookupName(it,force){
+  if(force)setStatus('商品名を探しています…');
+  const r=await findName(it.jan);
+  if(r.name){
+    if(it.name&&!force)return;
+    it.name=r.name;save();render();
+    if(state.cur===it){$('curName').value=it.name;syncCur()}
+    setStatus('商品名を自動入力しました（'+r.src+'）：'+r.name);
+  }else if(r.err){setStatus(errMsg(r.err),true)}
+  else if(force){setStatus(r.noKeys?'見つかりませんでした。本以外の商品は、下の「楽天APIの設定」をすると自動で探せます。':'商品名が見つかりませんでした。手で入力してください。',true)}
+}
+$('autoName').addEventListener('click',()=>{if(state.cur)lookupName(state.cur,true)});
+
+/* ---- 楽天APIの設定 ---- */
+function loadKeysUI(){const k=getKeys();$('rkApp').value=k?k.app:'';$('rkKey').value=k?k.key:'';$('rkState').textContent=k?'設定済みです。':'未設定です。'}
+$('rkSave').addEventListener('click',()=>{
+  const app=$('rkApp').value.trim(),key=$('rkKey').value.trim();
+  if(!app||!key){$('rkState').textContent='アプリIDとAccess Keyの両方を入れてください。';return}
+  setKeys({app,key});$('rkState').textContent='保存しました。「接続テスト」で動くか確認できます。';
+});
+$('rkTest').addEventListener('click',async()=>{
+  const k=getKeys();if(!k){$('rkState').textContent='先に保存してください。';return}
+  $('rkState').textContent='テスト中…';
+  try{const it=await rakuten('ichibams/api/IchibaItem/Search/20260701',{keyword:'4902370548495',hits:'1'},k);
+    $('rkState').textContent=it.length?'接続できました。商品名の自動取得が使えます。':'接続できました（テスト商品は見つかりませんでしたが、設定は正しいです）。';
+  }catch(e){$('rkState').textContent=errMsg(e)}
+});
+$('rkClear').addEventListener('click',()=>{setKeys(null);loadKeysUI();$('rkState').textContent='削除しました。'});
+loadKeysUI();
 
 function showCurrent(it,scroll){
   state.cur=it;$('current').hidden=false;
@@ -198,6 +327,8 @@ function syncCur(){
   const it=state.cur;if(!it)return;
   $('curStar').setAttribute('aria-pressed',it.fav?'true':'false');
   $('curStar').textContent=it.fav?'★':'☆';
+  $('curPrice').hidden=it.listPrice==null;
+  if(it.listPrice!=null)$('curPrice').textContent='本体価格 ¥'+it.listPrice.toLocaleString('ja-JP')+'（本の下段コードより）';
   $('curOnSale').href=mUrl(it,false);$('curSold').href=mUrl(it,true);$('curLookup').href=gUrl(it);
 }
 ['curName','curCost','curMemo'].forEach(id=>$(id).addEventListener('input',()=>{
@@ -226,7 +357,7 @@ function render(){
     const top=document.createElement('div');top.style.minWidth='0';
     const nm=document.createElement('div');nm.className='name';nm.textContent=it.name||'（商品名なし）';
     const meta=document.createElement('div');meta.className='meta';
-    meta.textContent=it.jan+' ・ '+fmtDate(it.t)+(it.cost!=null&&it.cost!==''?' ・ 仕入 ¥'+Number(it.cost).toLocaleString('ja-JP'):'');
+    meta.textContent=it.jan+' ・ '+fmtDate(it.t)+(it.listPrice!=null?' ・ 本体 ¥'+it.listPrice.toLocaleString('ja-JP'):'')+(it.cost!=null&&it.cost!==''?' ・ 仕入 ¥'+Number(it.cost).toLocaleString('ja-JP'):'');
     top.append(nm,meta);
     const star=document.createElement('button');star.className='star';star.setAttribute('aria-pressed',it.fav?'true':'false');
     star.setAttribute('aria-label','お気に入り');star.textContent=it.fav?'★':'☆';
@@ -251,8 +382,8 @@ $('tabFav').onclick=()=>{state.tab='fav';render()};
 /* ---- 転記 ---- */
 function cell(v,sep){v=v==null?'':String(v);if(sep===',')return /[",\n]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v;return v.replace(/[\t\n]/g,' ')}
 function buildTable(sep){
-  const head=['日付','JAN','商品名','仕入値','メモ','メルカリ販売中','メルカリ売り切れ'];
-  const rows=state.items.filter(i=>i.fav).map(it=>[fmtDate(it.t),it.jan,it.name||'',it.cost??'',it.memo||'',mUrl(it,false),mUrl(it,true)]);
+  const head=['日付','JAN','商品名','本体価格','仕入値','メモ','メルカリ販売中','メルカリ売り切れ'];
+  const rows=state.items.filter(i=>i.fav).map(it=>[fmtDate(it.t),it.jan,it.name||'',it.listPrice??'',it.cost??'',it.memo||'',mUrl(it,false),mUrl(it,true)]);
   return [head,...rows].map(r=>r.map(c=>cell(c,sep)).join(sep)).join('\n');
 }
 $('copyBtn').addEventListener('click',()=>{
@@ -274,10 +405,11 @@ $('clearFav').addEventListener('click',e=>{
   if(b.dataset.armed){state.items.forEach(i=>i.fav=false);save();syncCur();render();delete b.dataset.armed;b.textContent='お気に入りをすべて外す'}
   else{b.dataset.armed='1';b.textContent='もう一度押すとすべて外します';setTimeout(()=>{delete b.dataset.armed;b.textContent='お気に入りをすべて外す'},3000)}
 });
-$('manualForm').addEventListener('submit',e=>{e.preventDefault();if(addJan($('manual').value,false))$('manual').value=''});
+$('manualForm').addEventListener('submit',e=>{e.preventDefault();const r=addJan($('manual').value,false);if(r===true||r==='price')$('manual').value=''});
 
 /* ---- 連続スキャン ---- */
-let reader=null, audioCtx=null, lastCode='', lastTime=0, toastTimer=null;
+let reader=null, audioCtx=null, toastTimer=null;
+const recent=new Map();
 function beep(){
   if(!$('soundOn').checked||!audioCtx)return;
   try{const o=audioCtx.createOscillator(),g=audioCtx.createGain();o.frequency.value=1650;g.gain.value=0.12;o.connect(g);g.connect(audioCtx.destination);o.start();o.stop(audioCtx.currentTime+0.09)}catch(e){}
@@ -302,9 +434,13 @@ async function start(){
     await reader.decodeFromConstraints({audio:false,video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720}}},$('video'),(result)=>{
       if(!result)return;
       const code=result.getText();const now=Date.now();
-      if(code===lastCode&&now-lastTime<3000){lastTime=now;return}  // 同じ商品の連続読み取りを無視
-      lastCode=code;lastTime=now;
-      if(addJan(code,true)){sessionCount++;$('counter').textContent='今回 '+sessionCount+' 件';beep();flashHit(code)}
+      // 3秒以内に見たコードは無視（本の上段・下段を交互に読んでも重複しない）
+      if(recent.has(code)&&now-recent.get(code)<3000){recent.set(code,now);return}
+      recent.set(code,now);
+      const r=addJan(code,true);
+      if(r===true){sessionCount++;$('counter').textContent='今回 '+sessionCount+' 件';beep();flashHit(code)}
+      else if(r==='price'){beep();flashHit('本体価格 ¥'+parseInt(code.slice(7,12),10).toLocaleString('ja-JP'))}
+      else if(r==='skip'){flashHit('下段は読み飛ばしました')}
     });
   }catch(err){
     stop();
